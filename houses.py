@@ -1,34 +1,53 @@
-# %%
+# Imports
 
 import pandas as pd
 import numpy as np
 from scipy.stats import skew
 from scipy.stats import boxcox_normmax
 import scipy.special as ss
+from sklearn.linear_model import ElasticNet, Lasso
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import RobustScaler
+from sklearn.base import BaseEstimator, TransformerMixin, RegressorMixin, clone
+from sklearn.model_selection import KFold
+import xgboost as xgb
+import lightgbm as lgb
 import warnings
-
 warnings.filterwarnings('ignore')
+
+# Read Data
 train = pd.read_csv('train.csv')
 test = pd.read_csv('test.csv')
+
+# Preclean data
 train = train[train.GrLivArea < 4500]
 train.reset_index(drop=True, inplace=True)
+
+# Transform SalePrice to log of SalePrice
 train["SalePrice"] = np.log1p(train["SalePrice"])
 y = train['SalePrice'].reset_index(drop=True)
 test_ID = test.Id
+
+# Drop IDs
 train.drop('Id', inplace=True, axis=1)
 test.drop('Id', inplace=True, axis=1)
+
+# Concatenate to common dataset to perform FE
 data = pd.concat((train, test)).reset_index(drop=True)
 
+# Convert categorical columns
 strings = ['MSSubClass', 'YrSold', 'MoSold']
 for var in strings:
     data[var] = data[var].apply(str)
-
+# Filling missing data
 groups = ['Exterior1st', 'Exterior2nd', 'SaleType', 'Electrical', 'KitchenQual']
 for group in groups:
     mode = data[group].mode()[0]
     data[group] = data[group].fillna(mode)
 
 data.MSZoning = data.MSZoning.fillna('RL')
+data.Functional = data.Functional.fillna('Typ')
+data['LotFrontage'] = data.groupby('Neighborhood')['LotFrontage'].transform(lambda x: x.fillna(x.median()))
 
 for col in ['GarageType', 'GarageFinish', 'GarageQual', 'GarageCond', 'BsmtQual',
             'BsmtCond', 'BsmtExposure', 'BsmtFinType1', 'BsmtFinType2', "PoolQC"
@@ -39,40 +58,35 @@ for col in ('GarageArea', 'GarageCars', 'MasVnrArea', 'BsmtFinSF1', 'BsmtFinSF2'
             , 'BsmtFullBath', 'BsmtHalfBath', 'FullBath', 'HalfBath', 'BsmtUnfSF', 'TotalBsmtSF', 'GarageYrBlt'):
     data[col] = data[col].fillna(0)
 
-data.Functional = data.Functional.fillna('Typ')
-
-data['LotFrontage'] = data.groupby('Neighborhood')['LotFrontage'].transform(lambda x: x.fillna(x.median()))
-
 data.drop(['SalePrice'], axis=1, inplace=True)
 
+# Some new columns
 data['TotalSF'] = data.TotalBsmtSF + data['1stFlrSF'] + data['2ndFlrSF']
 data['TotalBath'] = data.FullBath + 0.5 * data.HalfBath + data.BsmtFullBath + 0.5 * data.BsmtHalfBath
 data['TotalPorch'] = data.OpenPorchSF + data['3SsnPorch'] + data.EnclosedPorch + data.ScreenPorch + data.WoodDeckSF
 data['YrBltAndRemod'] = data.YearBuilt + data.YearRemodAdd
-
 data['HasPool'] = data.PoolArea.apply(lambda x: 1 if x > 0 else 0)
 data['HasGarage'] = data.GarageArea.apply(lambda x: 1 if x > 0 else 0)
 data['HasBsmt'] = data.TotalBsmtSF.apply(lambda x: 1 if x > 0 else 0)
 data['HasFirePl'] = data.Fireplaces.apply(lambda x: 1 if x > 0 else 0)
 
+# Drop columns
 drops = ['Utilities', 'Street', 'PoolQC']
 data = data.drop(drops, axis=1)
 
 cat_features = data.select_dtypes(include=['object']).columns
-
 num_features = data.select_dtypes(exclude=['object']).columns
 
-feat_num = data[num_features].drop(['GarageYrBlt', 'MasVnrArea'], axis=1)
+# BoxCox transformation
+feat_num = data[num_features]
 feat_cat = data[cat_features]
-
 skewness = feat_num.apply(lambda x: skew(x))
-
 skewness = skewness[abs(skewness) > 0.5]
 skewed_features = skewness.index
 for feat in skewed_features:
-    feat_num[feat] = ss.boxcox1p(feat_num[feat], boxcox_normmax(feat_num[feat] + 1))
     data[feat] = ss.boxcox1p(data[feat], boxcox_normmax(data[feat] + 1))
 
+# Transform Quality columns to numbers
 qual_dict = {"None": 0, "Po": 1, "Fa": 2, "TA": 4, "Gd": 7, "Ex": 11}
 qual_cols = ["ExterQual", "ExterCond", "BsmtQual", "BsmtCond", "HeatingQC",
              "KitchenQual", "FireplaceQu", "GarageQual", "GarageCond", "PoolQC"]
@@ -81,27 +95,22 @@ for cat in data.columns:
     if cat in qual_cols:
         data[cat] = data[cat].map(qual_dict).astype('int64')
 
+# Dumming all set
 fin_data = pd.get_dummies(data).reset_index(drop=True)
-
+# Splitting back
 train = fin_data.iloc[:len(y), :]
 test = fin_data.iloc[len(y):, :]
 
+# Drop some outliers
 outliers = [30, 88, 462, 631, 1322]
 train = train.drop(train.index[outliers])
 y_train = y.drop(y.index[outliers])
 
 y = y_train.values
 
-from sklearn.linear_model import ElasticNet, Lasso
-from sklearn.pipeline import make_pipeline
-from sklearn.preprocessing import RobustScaler
-from sklearn.base import BaseEstimator, TransformerMixin, RegressorMixin, clone
-from sklearn.model_selection import KFold
-import xgboost as xgb
-import lightgbm as lgb
-
 n_folds = 5
 
+# Models
 lasso = make_pipeline(RobustScaler(), Lasso(alpha=0.00057, random_state=1))
 
 ENet = make_pipeline(RobustScaler(), ElasticNet(alpha=0.0005, l1_ratio=.9, random_state=3))
@@ -133,32 +142,6 @@ model_lgb_estimatorsH = lgb.LGBMRegressor(objective='regression', num_leaves=5,
                                           bagging_freq=5, feature_fraction=0.2319,
                                           feature_fraction_seed=9, bagging_seed=9,
                                           min_data_in_leaf=3, min_sum_hessian_in_leaf=11)
-
-
-class AveragingModels(BaseEstimator, RegressorMixin, TransformerMixin):
-    def __init__(self, models):
-        self.models = models
-
-    # we define clones of the original models to fit the data in
-    def fit(self, X, y):
-        self.models_ = [clone(x) for x in self.models]
-
-        # Train cloned base models
-        for model in self.models_:
-            model.fit(X, y)
-
-        return self
-
-    # Now we do the predictions for cloned models and average them
-    def predict(self, X):
-        predictions = np.column_stack([
-            model.predict(X) for model in self.models_
-        ])
-        return np.mean(predictions, axis=1)
-
-
-averaged_models = AveragingModels(models=(ENet, model_xgb, model_lgb, model_xgb_deep, lasso))
-
 
 class StackingAveragedModels(BaseEstimator, RegressorMixin, TransformerMixin):
     def __init__(self, base_models, meta_model, n_folds=5):
